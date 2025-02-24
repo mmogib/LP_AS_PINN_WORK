@@ -1,74 +1,35 @@
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
+# from torch.utils.data import Dataset, DataLoader
 import datetime
 from colorama import just_fix_windows_console, init, Fore, Style
-from typing import List, Callable
+from typing import List, Callable, Optional, Tuple
 from prettytable import PrettyTable, ALL
 
+from ode import createObjectiveFun, createPhi
 
-class PINN_B(nn.Module):
-    def __init__(self, out_dim=5):
+
+class PINN(nn.Module):
+    def __init__(self, in_dim=2, out_dim=5):
         super(PINN, self).__init__()
         # Input dimension becomes 2: one from t and one from the pooled b.
-        self.fc1 = nn.Linear(2, 100)
+        self.fc1 = nn.Linear(in_dim, 100)
         self.fc2 = nn.Linear(100, out_dim)
         self.activation = nn.Tanh()
+        self.in_dim = in_dim
         self.out_dim = out_dim
 
-    def forward(self, t, b):
-        """
-        Forward pass for inputs t and b.
-          - t: tensor of shape (N, 1) (or scalar, which will be unsqueezed)
-          - b: tensor of variable length. For a batch, we expect shape (N, L)
-               where L can vary across different calls but should be >0.
-
-        We average b over its variable dimension to get a fixed-size (N, 1) tensor,
-        then concatenate it with t. The output is modulated as:
-            ŷ(t) = (1 - exp(-t)) * NN([t, pooled_b])
-        to enforce ŷ(0)=0.
-        """
-        # Ensure t is batched (if given as a scalar, make it (1, 1))
-        if t.dim() == 0:
-            t = t.unsqueeze(0)
-        # Ensure b is batched:
-        if b.dim() == 1:
-            b = b.unsqueeze(0)  # now shape (1, L)
-
-        # Average b over its last dimension (variable-length dimension)
-        b_avg = torch.mean(b, dim=1, keepdim=True)  # shape: (N, 1)
-
-        # Concatenate t and b_avg along feature dimension
-        input_tensor = torch.cat([t, b_avg], dim=1)  # shape: (N, 2)
-
-        x = self.activation(self.fc1(input_tensor))
-        out = self.fc2(x)
-        # The modulation factor uses t; note that t has shape (N, 1)
-        return (1 - torch.exp(-t)) * out
-
-
-# ------------------------------
-# Define the PINN model (moved to GPU)
-# ------------------------------
-class PINN(nn.Module):
-    def __init__(self, out_dim=5):
-        super(PINN, self).__init__()
-        self.fc1 = nn.Linear(1, 100)
-        self.fc2 = nn.Linear(100, out_dim)
-        self.activation = nn.Tanh()
-        self.out_dim = out_dim
-
-    def forward(self, t):
-        """
-        Forward pass for a scalar (or batch) time input.
-        We assume t is a tensor of shape (N, 1) or a scalar tensor.
-        The network output is modulated as:
-            ŷ(t) = (1 - exp(-t)) * NN(t)
-        to enforce ŷ(0) = 0.
-        """
-        if t.dim() == 0:
-            t = t.unsqueeze(0)
-        x = self.activation(self.fc1(t))
+    def forward(self, tb):
+        # If tb is a scalar, convert it to a 2D tensor with shape (1, in_dim)
+        if tb.dim() == 0:
+            tb = tb.unsqueeze(0).unsqueeze(1)
+        elif tb.dim() == 1:
+            tb = tb.unsqueeze(1)
+        t = tb[:, 0].unsqueeze(1)  # Now safe because tb is at least 2D.
+        x = self.activation(self.fc1(tb))
         out = self.fc2(x)
         return (1 - torch.exp(-t)) * out
 
@@ -78,17 +39,15 @@ class PINN(nn.Module):
 # ------------------------------
 def create_loss(
     model: PINN,
-    ts: torch.Tensor,
+    tb: torch.Tensor,
     phi: Callable[[torch.Tensor], torch.Tensor],
-    *,
-    bs: torch.Tensor | None = None,
 ):
 
     def loss_t():
         # ts: shape (N,) ; we need to work with scalar inputs, so we keep ts as a 1D tensor.
         # Evaluate the PINN on all collocation points.
         # The model expects input shape (N,1), so unsqueeze ts.
-        ts_var = ts.clone().detach().requires_grad_(True)  # shape (N,)
+        ts_var = tb.clone().detach().requires_grad_(True)  # shape (N,)
         y_hat = model(ts_var.unsqueeze(1))
 
         def model_single(t):
@@ -96,7 +55,7 @@ def create_loss(
 
         dy_dt = torch.vmap(torch.func.jacrev(model_single))(ts_var)  # shape: (N, 5)
 
-        phi_y = torch.vmap(phi)(y_hat)
+        phi_y = torch.vmap(phi)(y_hat.squeeze(0))
 
         residuals = dy_dt - phi_y
 
@@ -104,58 +63,308 @@ def create_loss(
         return loss
 
     def loss_b():
-        N = ts.shape[0]  # number of time points
-        M = bs.shape[0]  # number of parameter sets
+        """
+        Compute the mean squared loss:
+            loss = mean( || d/dt y_hat(tb) - phi(y_hat(tb), b) ||^2 )
+        where tb is of shape (N, L) with L>=2:
+        - tb[:, 0] contains time t (shape (N,1))
+        - tb[:, 1:] contains b (shape (N, L-1))
 
-        # Expand ts and bs to create (N*M) pairs
-        ts_expanded = ts.repeat_interleave(M)  # shape: (N*M,)
-        bs_expanded = bs.repeat(N, 1)  # shape: (N*M, L)
+        The function phi, when called as phi(b) with b of shape (L-1,), returns a function
+        that accepts a single sample y (of shape (out_dim,)) and returns a tensor of shape (out_dim,).
+        """
+        # Ensure tb is differentiable.
+        tb_var = tb.clone().detach().requires_grad_(True)  # shape: (N, L)
 
-        # Unsqueeze ts_expanded to shape (N*M, 1) for model input
-        ts_var = ts_expanded.unsqueeze(1).clone().detach().requires_grad_(True)
+        # Evaluate model: y_hat will have shape (N, out_dim)
+        y_hat = model(tb_var)
+        # print("y_hat shape:", y_hat.shape)
+        # print("y_hat:", y_hat)
 
-        # Evaluate the model -> shape (N*M, out_dim)
-        y_hat = model(ts_var, bs_expanded)
+        N = tb.shape[0]
+        dy_dt = torch.zeros_like(y_hat)  # to store the derivative with respect to t
 
-        # Compute derivative wrt t for each sample in a loop (simpler to read)
-        # For better performance, you might use functorch's jacrev + vmap if supported.
-        out_dim = y_hat.shape[1]
-        dy_dt = torch.zeros_like(y_hat)
+        # For each sample, compute the derivative of the model output with respect to t.
+        for i in range(N):
+            # Extract t: first column of tb_var for sample i.
+            # t_val: shape (1, 1)
+            t_val = tb_var[i, 0].unsqueeze(0).unsqueeze(1)
+            # Extract b: remaining columns of tb_var for sample i.
+            # b_val: shape (1, L-1)
+            b_val = tb_var[i, 1:].unsqueeze(0)
 
-        for i in range(N * M):
-            # Single sample
-            t_val = ts_var[i : i + 1]  # shape (1,1)
-            b_val = bs_expanded[i : i + 1]  # shape (1, L)
-
-            # Define a single-sample closure for autograd
             def single_sample(t_s):
-                return model(t_s, b_val).squeeze(0)  # shape (out_dim,)
+                # t_s has shape (1,1). Concatenate with fixed b_val to form a full sample of shape (1, L)
+                sample_input = torch.cat([t_s, b_val], dim=1)
+                # Call the model and remove the batch dimension.
+                return model(sample_input).squeeze(0)  # shape: (out_dim,)
 
-            # Use autograd to compute derivative wrt t
-            _, back_fn = torch.autograd.functional._jvp(
-                single_sample,  # function
-                (t_val,),  # primal
-                (torch.ones_like(t_val),),  # tangent
+            # Compute the directional derivative (Jacobian-vector product) with respect to t.
+            # Here we compute d/dt at t_val in the direction of 1.
+            _, jvp = torch.autograd.functional.jvp(
+                single_sample, (t_val,), (torch.ones_like(t_val),)
             )
-            # back_fn is the directional derivative wrt t, shape (out_dim,)
-            dy_dt[i] = back_fn
+            dy_dt[i] = jvp  # shape (out_dim,)
 
-            # Apply phi -> shape (N*M, out_dim)
-            phi_y = phi(y_hat, bs_expanded)
+        # Now, for each sample, apply the physics operator.
+        phi_y_list = []
+        for i in range(N):
+            # For sample i, b_i is the parameter vector: shape (L-1,)
+            b_i = tb_var[i, 1:]
+            # Get the phi operator for this b.
+            phi_func = phi(b_i)
+            # Apply it to the model output for sample i.
+            phi_y_list.append(phi_func(y_hat[i]))
+        # Stack the results: shape (N, out_dim)
+        phi_y = torch.stack(phi_y_list, dim=0)
 
-            # Residual = dy_dt - phi_y
-            residuals = dy_dt - phi_y
+        # Compute the residual and then the mean squared error.
+        residuals = dy_dt - phi_y
+        loss_val = torch.mean(torch.sum(residuals**2, dim=1))
+        return loss_val
 
-            # Mean of sum of squares -> effectively 1/(N*M) * sum ||residuals||^2
-            sq_norm = torch.sum(residuals**2, dim=1)  # shape: (N*M,)
-            loss_val = torch.mean(sq_norm)
-            return loss_val
-
-    loss_fn = loss_t if bs is None else loss_b
+    loss_fn = loss_t if tb.shape[1] == 1 else loss_b
     return loss_fn
 
 
 # Save the model's state dictionary to a file
+
+
+def create_batches(
+    *,
+    batch_size: int = 128,
+    no_batches: int = 1,
+    tspan: Tuple[float, float] = (0.0, 10.0),
+    in_dim: int = 5,
+    device: torch.device = torch.device("cpu"),
+) -> List[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    # Create a list of time batches: each tensor has shape (batch_size, 1)
+    ts_batches = [
+        torch.empty(batch_size, dtype=torch.float32, device=device)
+        .uniform_(*tspan)
+        .unsqueeze(1)
+        for _ in range(no_batches)
+    ]
+
+    if in_dim == 1:
+        # Return a list of tuples (ts, None)
+        return [(ts, None) for ts in ts_batches]
+    else:
+        # Create a list of b batches: each tensor has shape (batch_size, in_dim - 1)
+        b_list = [
+            torch.empty(
+                (batch_size, in_dim - 1), dtype=torch.float32, device=device
+            ).uniform_(*tspan)
+            for _ in range(no_batches)
+        ]
+
+        # Zip the two lists together into a list of tuples (ts, b)
+        return list(zip(ts_batches, b_list))
+
+
+def load_model(model, device: torch.DeviceObjType, filename):
+    model.load_state_dict(torch.load(filename, map_location=device))
+    return model
+
+
+def train_model(A, b, D, name, tspan, rhs, epochs, batch_size, batches, device):
+
+    b_raw = b.tolist()[0]
+    phi = createPhi(D, A)
+    out_dim = sum(A.shape)
+    if rhs == 0:
+        in_dim = 1
+        model, loss_list, mov_list = _train_model(
+            phi(b),
+            createObjectiveFun(D),
+            tspan=tspan,
+            in_dim=in_dim,
+            out_dim=out_dim,
+            batch_size=batch_size,
+            no_batches=batches,
+            epochs=epochs,
+            lr=0.001,
+            tol=1e-3,
+            training_name=name,
+            device=device,
+        )
+    else:
+        in_dim = len(b_raw) + 1
+        model, loss_list, mov_list = _train_model(
+            phi,
+            createObjectiveFun(D),
+            tspan=tspan,
+            in_dim=in_dim,
+            out_dim=out_dim,
+            batch_size=batch_size,
+            no_batches=batches,
+            epochs=epochs,
+            lr=0.001,
+            tol=1e-3,
+            training_name=name,
+            device=device,
+            testing_tb=[tspan[1], *b_raw],
+        )
+    return model, loss_list, mov_list
+
+
+def _train_model(
+    phi,  # physics operator generator: phi(b) returns a function to apply to model output.
+    objective_fun,  # function that computes a scalar objective from model output.
+    *,
+    tspan: Tuple[float, float] = (0.0, 10.0),
+    in_dim: int = 1,
+    out_dim: int = 5,
+    batch_size: int = 128,
+    no_batches: int = 1,
+    epochs: int = 1000,
+    lr: float = 0.001,
+    tol: float = 1e-5,
+    training_name: str = "",
+    device: torch.device = torch.device("cpu"),
+    testing_tb: List[
+        float
+    ] = None,  # required when in_dim > 1; list of floats: first element is t, rest are b.
+):
+    just_fix_windows_console()
+    init()
+    T = tspan[1]
+    loss_list = []
+    mov_list = []
+
+    batched_data = create_batches(
+        batch_size=batch_size,
+        no_batches=no_batches,
+        tspan=tspan,
+        in_dim=in_dim,
+        device=device,
+    )
+    if in_dim == 1:
+        t_eval = torch.tensor(
+            [[T]], dtype=torch.float32, device=device, requires_grad=True
+        )
+    else:
+        # testing_tb should be provided as a list: first element is t, rest are b.
+        t_eval = torch.tensor(
+            [testing_tb], dtype=torch.float32, device=device, requires_grad=True
+        )
+    print("Batched data created.")
+    # Create the model using the provided in_dim.
+    model = PINN(in_dim=in_dim, out_dim=out_dim).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    print(Fore.RED + f"Starting training {training_name}" + Style.RESET_ALL)
+    bb = torch.empty(
+        (batch_size, in_dim - 1), dtype=torch.float32, device=device
+    ).uniform_(*tspan)
+    epoch = 1
+    while True:
+        epoch_loss = 0.0
+        # Use tqdm over ts_batches; we also need the index so we use enumerate.
+        pbar = tqdm(
+            batched_data,
+            total=no_batches,
+            desc=f"Epoch {epoch}/{epochs} training {no_batches} batches ",
+            leave=False,
+        )
+        for ts, b in pbar:
+            tb = ts if b is None else torch.cat([ts, bb], dim=1)
+            compute_loss_vectorized = create_loss(model, tb, phi)
+            optimizer.zero_grad()
+            loss_val = compute_loss_vectorized()
+            loss_val.backward()
+            optimizer.step()
+            loss_item = loss_val.item()
+            epoch_loss += loss_item
+            loss_list.append(loss_item)
+            pbar.set_postfix(loss=f"{loss_item:.6f}")
+            y_pred = model(t_eval)
+            val = objective_fun(y_pred[0])
+            mov_list.append(val.item())
+
+        epoch_loss /= no_batches
+
+        if epoch % 100 == 0:
+            print(
+                Fore.MAGENTA
+                + f"{training_name} | {no_batches} batches, Epoch {epoch}/{epochs}: Loss = {epoch_loss:.6f}"
+                + Style.RESET_ALL
+            )
+        if epoch_loss < tol:
+            print(
+                Fore.GREEN
+                + f"{training_name} | Stopping training at epoch {epoch} with loss = {epoch_loss:.6f}"
+                + Style.RESET_ALL
+            )
+            break
+        if epoch == epochs:
+            print(
+                Fore.GREEN
+                + f"{training_name} | Max iteration {epochs} reached: stopping training loss = {epoch_loss:.6f}"
+                + Style.RESET_ALL
+            )
+            break
+
+        epoch += 1
+
+    # Evaluation step:
+
+    print(Fore.BLUE + "Training complete.\n" + Style.RESET_ALL)
+    return model, loss_list, mov_list
+
+
+def test_model(model, dev, b_raw, rhs, T, name, epochs):
+    # ------------------------------
+    # Evaluate the trained model at select time points
+    # ------------------------------
+    name = name.lower().replace(" ", "_")
+    filename = f"saved_models/{name}"
+    test_times = [i * (T / 5) for i in range(6)]
+    if rhs == 0:
+        _test_model(model, test_times, dev=dev)
+        filename = f"{filename}_with_same_rhs_pinn_{epochs}"
+    else:
+        b_tests = [b_raw for _ in range(6)]
+        _test_model(model, test_times, dev=dev, b_tests=b_tests)
+        filename = f"{filename}_with_random_rhs_pinn_{epochs}"
+
+    return filename
+
+
+def _test_model(
+    model: PINN,
+    test_times: List[float],
+    *,
+    dev: torch.DeviceObjType = torch.device("cpu"),
+    b_tests: List[List[float]] | None = None,
+):
+    table = PrettyTable()
+    table.field_names = ["t", "ŷ(t)"]
+    # Set horizontal rules between every row
+    table.hrules = ALL
+    # Left-align each column
+    table.align["t"] = "l"
+    table.align["ŷ(t)"] = "l"
+
+    for i, t in enumerate(test_times, start=1):
+        if b_tests is not None:
+            b = b_tests[i - 1]
+
+            t_tensor = torch.tensor(
+                [t, *b], dtype=torch.float32, device=dev, requires_grad=True
+            ).unsqueeze(0)
+
+            y_pred = model(t_tensor)
+        else:
+            t_tensor = torch.tensor(
+                t, dtype=torch.float32, device=dev, requires_grad=True
+            )
+            y_pred = model(t_tensor)
+        # Flatten the tensor and convert to a formatted string
+        y_pred_str = str(y_pred.detach().cpu().numpy().flatten())
+        table.add_row([f"{t:6.2f}", y_pred_str])
+
+    # Print the entire table with color formatting
+    print(Fore.MAGENTA + table.get_string() + Style.RESET_ALL)
 
 
 # Get the current date in YYYY_MM_DD format
@@ -169,96 +378,3 @@ def save_model(model: PINN, name: str = "pinn_model"):
     torch.save(model.state_dict(), filename)
 
     print(f"Model saved to {filename}")
-
-
-def train_model(
-    phi,
-    objective_fun,
-    ts_batches,
-    b_list,
-    device,
-    T=10.0,
-    lr=0.001,
-    epochs=1000,
-    tol=1e-5,
-    out_dim=5,
-):
-    just_fix_windows_console()
-    init()
-
-    model = PINN(out_dim=out_dim).to(device)
-    # ------------------------------
-    # Training Loop using Adam (lr = 0.001) on the GPU
-    # ------------------------------
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    print(Fore.RED + "Starting training..." + Style.RESET_ALL)
-    batches = len(ts_batches)
-    loss_list = []
-    MOV = 0
-    no_of_bs = len(b_list)
-    for rhs, b in enumerate(b_list, start=1):
-        for batch, ts in enumerate(ts_batches, start=1):
-            compute_loss_vectorized = create_loss(model, ts, phi(b))
-            for epoch in range(1, epochs + 1):
-                optimizer.zero_grad()
-                loss_val = compute_loss_vectorized()
-                loss_val.backward()
-                optimizer.step()
-
-                loss_valued = loss_val.item()
-
-                loss_list.append(loss_valued)
-
-                # Print loss every 10 epochs.
-                if epoch % 100 == 0:
-                    print(
-                        Fore.MAGENTA
-                        + f"(RHS: {rhs}) Batch {batch}/{batches},  Epoch {epoch}/{epochs}: Loss = {loss_valued:.6f}"
-                        + Style.RESET_ALL
-                    )
-                # Stop if loss is below the threshold.
-                if loss_valued < tol:
-                    print(
-                        Fore.GREEN
-                        + f"Stopping training at epoch {epoch} with loss = {loss_valued:.6f}"
-                        + Style.RESET_ALL
-                    )
-                    break
-            y_pred = model(
-                torch.tensor(T, dtype=torch.float32, device=device, requires_grad=True)
-            )
-            val = objective_fun(y_pred)
-            MOV = MOV + val.item()
-
-    print(Fore.BLUE + "Training complete.\n" + Style.RESET_ALL)
-    return model, loss_list, MOV / (batches * len(b_list))
-
-
-def load_model(model, device: torch.DeviceObjType, filename):
-    model.load_state_dict(torch.load(filename, map_location=device))
-    return model
-
-
-def test_model(
-    model: PINN,
-    test_times: List[int],
-    *,
-    dev: torch.DeviceObjType = torch.device("cpu"),
-):
-    table = PrettyTable()
-    table.field_names = ["t", "ŷ(t)"]
-    # Set horizontal rules between every row
-    table.hrules = ALL
-    # Left-align each column
-    table.align["t"] = "l"
-    table.align["ŷ(t)"] = "l"
-    for t in test_times:
-        t_tensor = torch.tensor(t, dtype=torch.float32, device=dev, requires_grad=True)
-        y_pred = model(t_tensor)
-        # Flatten the tensor and convert to a formatted string
-        y_pred_str = str(y_pred.detach().cpu().numpy().flatten())
-        table.add_row([f"{t:6.2f}", y_pred_str])
-
-    # Print the entire table with color formatting
-    print(Fore.MAGENTA + table.get_string() + Style.RESET_ALL)
